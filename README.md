@@ -12,4 +12,4 @@ Install:
 #Example: 
 if you have a seurat obj, a feature column Inf, a feature column Sample_ID, and four levels in the Inf column:
 
-> HOSVDSig(obj,prefix,featureName="Inf",SampleID="Sample_ID",flevel=c("control","non","adjacent","inf")
+> HOSVDSig(obj,prefix,featureName="Inf",SampleID="Sample_ID",flevel=c("control","non","adjacent","inf"))
