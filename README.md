@@ -6,6 +6,7 @@ and extract variable network signatures
 Install:
 
 > install.packages("devtools")
+> 
 > devtools::install_github("bingqing-Xie/HOSVDSig")
 
 #Example: 
