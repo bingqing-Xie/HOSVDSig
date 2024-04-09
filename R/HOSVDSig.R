@@ -1,0 +1,257 @@
+#' HOSVDSig
+#'
+#' This function constructs co-expression network for highly vairable and expressed genes split by samples and 
+#' It decomposes the co-expression network into 3 matrices with k TCs, k = min(#Gene, #Sample)
+#' and extract variable network signatures
+#' 
+#'
+#' @obj  a Seurat object
+#' @prefix  output folder to save the results
+#' @featureName feature column in the seurat object meta data, has ordered character values
+#' @SampleID feature column to split the object into set of samples
+#' @flevel the order of the categories in the featureName variable
+#' @pthres adjusted P value threshold for selecting highest correlated TCs
+#' @zthres z-score threshold for selecting driving genes for TCs
+#' @recompute_glasso if TRUE, recompute the graphical lasso based co-expression network; if FALSE, load the coexpression matrix 
+#' @recompute_HOSVD if TRUE, decompose the co-expression network; if FALSE, load the decomposed matrices
+#' @export
+HOSVDSig=function(obj,prefix,featureName="To_inf",SampleID="Sample_ID",flevel=c("control","non","adjacent","inf"),	pthres=0.05,zthres=2,recompute_glasso=TRUE,recompute_HOSVD=TRUE){
+
+	minExpr=0.1
+	if(recompute_glasso){
+	
+		
+		####################################################################################################
+		################## Find highly variable and expressed genes                   ######################
+		####################################################################################################
+		obj=FindVariableFeatures(obj,nfeatures = 2000)
+		hvf=HVFInfo(obj)[VariableFeatures(obj),]
+		hvf=hvf[order(hvf$mean,decreasing=T),]
+		varFeatures=intersect(rownames(subset(HVFInfo(obj),mean>minExpr)),VariableFeatures(obj))
+
+		objlist=SplitObject(obj,SampleID)
+		sampleNames=names(objlist)
+		nFeatures=length(varFeatures)
+		nsamples=length(sampleNames)
+		write.csv(varFeatures,file=paste0(prefix,"HOSVDSig_varFeatures.csv"))
+		write.csv(sampleNames,file=paste0(prefix,"HOSVDSig_sampleNames.csv"))
+		
+		
+		#######################################################################################################################
+		################## Generate Tensor for co-expression network (genes x genes x samples)           ######################
+		#######################################################################################################################
+		t_coexp=rand_tensor(modes=c(nFeatures,nFeatures,nsamples))
+		#t_coexp=list()
+
+
+		for(i in 1:length(objlist)){
+			ptm <- proc.time()
+			print(name(objlist)[i])
+			s=var(t(as.matrix(GetAssayData(objlist[[i]],slot="counts")[varFeatures,] )))
+			print(dim(s))
+			print(proc.time() - ptm)
+			ptm <- proc.time()
+			#coexp=glassoFast(s, rho=0.1)	
+			coexp=glasso(s, rho=0.1)	
+			print(proc.time() - ptm)
+			ptm <- proc.time()
+			wi = coexp$wi
+			print(sum(wi>0)/(nFeatures*nFeatures))
+			for(j in 1:nFeatures){
+				wi[j,j:nFeatures]=wi[j:nFeatures,j]
+			}
+			print(sum(wi>0)/(nFeatures*nFeatures))
+			t_coexp[,,i]=wi
+				
+			print(proc.time() - ptm)
+
+			saveRDS(wi,file=paste0(prefix,"HOSVDSig_",names(objlist)[i],"_coexp_glasso.rds"))
+		}
+
+
+		saveRDS(t_coexp,file=paste0(prefix,"HOSVDSig_","_coexp_glasso.rds"))
+	}else{
+
+		varFeatures=read.csv(file=paste0(prefix,"HOSVDSig_varFeatures.csv"),row.names=1)[,1]
+		sampleNames=read.csv(file=paste0(prefix,"HOSVDSig_sampleNames.csv"),row.names=1)[,1]
+		
+		nFeatures=length(varFeatures)
+		nsamples=length(sampleNames)
+		t_coexp=readRDS(file=paste0(prefix,"HOSVDSig_coexp_glasso.rds"))
+	}
+	if(recompute_HOSVD){
+	
+		#######################################################################################################################
+		################## Use HOSVD to decompose the tensor into three loading matrices                 ######################
+		#######################################################################################################################
+		ptm <- proc.time()
+		cp_decomp <- cp(t_coexp, num_components = nsamples, max_iter = 100)
+		str(cp_decomp$U)
+
+		print(proc.time() - ptm)
+		ptm <- proc.time()
+		saveRDS(cp_decomp,file=paste0(prefix,"HOSVDSig_cp_decomp.rds"))
+	}else{
+		cp_decomp=readRDS(file=paste0(prefix,"HOSVDSig_cp_decomp.rds"))
+	}
+
+	#######################################################################################################################
+	################## Attaching the feature to the sample loading matrix                            ######################
+	#######################################################################################################################
+
+	df2=data.frame(cp_decomp$U[[3]])
+	colnames(df2)=paste0("Comp",1:ncol(df2))
+	df2[,SampleID]=sampleNames
+	meta=combined@meta.data
+	meta=meta[!duplicated(meta[,SampleID]),]
+	df2=cbind(df2,meta[df2[,SampleID],])
+
+	write.csv(df2,file=paste0(prefix,"HOSVDSig_TC_all_comp.csv"))
+
+
+
+	#######################################################################################################################
+	################## Select significant correlated TCs                                             ######################
+	#######################################################################################################################
+	plotdata=scale(df2[,1:nsamples])
+	df2$groupFeature=factor(df2[,featureName],levels=flevel)
+	png(paste0(prefix,"HOSVDSig_TC_all.png"),height=600,width=500)
+	Heatmap(plotdata,row_split=df2$groupFeature)
+	dev.off()
+	correlations=c()
+	for(i in 1:nsamples){
+		temp=cor.test(df2[,i],as.numeric(factor(df2$groupFeature,levels=c("control","non","adjacent","inf"))),method="spearman")
+		correlations=rbind(correlations,c(i,temp$estimate,temp$p.value))
+	}
+	colnames(correlations)=c("Comp","rho","p.value")
+	correlations=data.frame(correlations)
+	correlations$p.adj.fdr=p.adjust(correlations$p.value,method="fdr")
+	write.csv(correlations,file=paste0(prefix,"HOSVDSig_TC_all_correlation.csv"))
+
+
+
+	selectComp=correlations$p.adj.fdr<pthres
+	write.csv(correlations$Comp[selectComp],file=paste0(prefix,"HOSVDSig_selectComp.csv"))
+	
+	
+	#######################################################################################################################
+	################## Select driving genes for correlated TCs (TC2)                                 ######################
+	#######################################################################################################################
+	if(sum(selectComp)>0){
+		df_loading=data.frame(cp_decomp$U[[2]])
+		colnames(df_loading)=paste0("Comp",1:ncol(df_loading))
+		rownames(df_loading)=varFeatures
+		write.csv(df_loading,file=paste0(prefix,"HOSVDSig_TC2_all_loading.csv"))
+
+		
+		df_loading_Sig=df_loading[,correlations[selectComp,"Comp"]]
+		rownames(df_loading_Sig)=varFeatures
+
+
+		plotdata=scale(df_loading_Sig)
+		select_genes=rowSums(abs(plotdata)>zthres)>0
+		print(sum(select_genes))
+
+		if(sum(select_genes)>0){
+			png(paste0(prefix,"HOSVDSig_TC2_sig_loadings.png"))
+			print({
+			Heatmap(plotdata[select_genes,])
+			})
+			dev.off()
+		}
+
+
+
+		select_genes2=select_genes
+
+
+		#######################################################################################################################
+		################## Select driving genes for correlated TCs (TC2)                                 ######################
+		#######################################################################################################################
+		df_loading=data.frame(cp_decomp$U[[1]])
+		colnames(df_loading)=paste0("Comp",1:ncol(df_loading))
+		rownames(df_loading)=varFeatures
+		write.csv(df_loading,file=paste0(prefix,"HOSVDSig_TC1_all_loading.csv"))
+
+
+		df_loading_Sig=df_loading[,correlations[selectComp,"Comp"]]
+		rownames(df_loading_Sig)=varFeatures
+
+
+		plotdata=scale(df_loading_Sig)
+		select_genes=rowSums(abs(plotdata)>zthres)>0
+		print(sum(select_genes))
+
+		if(sum(select_genes)>0){
+			png(paste0(prefix,"HOSVDSig_TC1_sig_loadings.png"))
+				print({
+			Heatmap(plotdata[select_genes,])
+			})
+			dev.off()
+		}
+
+		#############################################################
+
+		select_genes1=select_genes
+
+		#############################################################
+
+		select_genes=(select_genes2+select_genes1)>0
+		write.csv(names(select_genes[select_genes]),file=paste0(prefix,"HOSVDSig_select_genes.csv"))
+
+
+		#######################################################################################################################
+		##################Generate networks by binarizing the co-expression to -1 (negative correlation),######################
+		################## 0(no correlation), 1(positive correlation)                                    ######################
+		#######################################################################################################################
+
+		types=flevel
+		nfeatures=length(varFeatures)
+		net_pos=list()
+		net_neg=list()
+		net=list()
+		for(i in types){
+			net[[i]]=matrix(0,nfeatures,nfeatures)
+			rownames(net[[i]])=varFeatures
+			colnames(net[[i]])=varFeatures
+			net_pos[[i]]=net[[i]]
+			net_neg[[i]]=net[[i]]
+			for(ssample in which(df2$groupFeature==i)){
+				v1=vec(t_coexp[,,ssample])
+				m1=matrix(v1,nrow = nfeatures)
+				#net[[i]]=net[[i]]+(m1>0)
+				net_pos[[i]]=net_pos[[i]]+(m1>0)
+				net_neg[[i]]=net_neg[[i]]-(m1<0)
+				net[[i]]=net_pos[[i]]+net_neg[[i]]
+				
+			for(j in 1:nrow(net_sp)){net_sp[j,j]=0}
+			#m1=m1[,colSums(m1)!=0]
+			}
+		}
+		saveRDS(net,file=paste0(prefix,"HOSVDSig_net_all.rds"))
+		
+		#######################################################################################################################
+		################## Save networks by the group                                                    ######################
+		#######################################################################################################################
+
+
+		for(i in  types){
+			net_sp=net_pos[[i]]+net_neg[[i]]
+			for(j in 1:nrow(net_sp)){net_sp[j,j]=0}
+			net_sp=net_sp[select_genes, colSums( net_sp[select_genes,] ) >0 ]
+			net_sp=net_sp/sum(df2$groupFeature==i)*100
+
+			net_pair=c()
+			for(j in 1:nrow(net_sp)){
+				for( k in 1:ncol(net_sp)){
+					if(net_sp[j,k]!=0){
+						net_pair=rbind(net_pair, c(rownames(net_sp)[j],colnames(net_sp)[k],net_sp[j,k]))
+					}
+				}		
+			}
+			write.csv(net_pair,file=paste0(prefix,"HOSVDSig_net_",i,".csv"),quote=FALSE,row.names=F)
+		}
+
+		write.csv(cbind(select_genes[select_genes],"Sig"),file=paste0(prefix,"HOSVDSig_node.csv"))
+	}
+}
